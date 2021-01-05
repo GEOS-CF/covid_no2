@@ -59,9 +59,9 @@ def main(args):
     # predictions (to be compared against actual observations)
     runtimes = []
     for c in args.cities:
-        t1 = time.process_time()
+        t1 = time.perf_counter()
         nlocations = _train_and_predict(args,allobs,allmod,c)
-        runtimes.append(pd.DataFrame({'city':[c],'locations':[nlocations],'runtime':[time.process_time()-t1]}))
+        runtimes.append(pd.DataFrame({'city':[c],'locations':[nlocations],'runtime':[time.perf_counter()-t1]}))
     # show runtimes
     rtimes = pd.concat(runtimes)
     rtimes['time_per_loc'] = rtimes['runtime']/rtimes['locations']
