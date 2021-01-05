@@ -20,7 +20,6 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
 import matplotlib.dates as mdates
 import time
-import seaborn as sns
 
 from pandas.plotting import register_matplotlib_converters
 register_matplotlib_converters()
@@ -303,6 +302,7 @@ def _make_timeseries(args,anomalies,rolling=21,mindate=dt.datetime(2019,1,1),tit
 
 def _plot_shap_values(args,shap_list,title):
     '''Make boxplot of SHAP values for the given location'''
+    import seaborn as sns
     log = logging.getLogger(__name__)
     NFEATURES = 20 # number of features to plot
     # get dataframe with all shap values and melt into 2-column array (one column for feature name, the other for the SHAP value)
