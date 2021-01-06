@@ -72,7 +72,7 @@ def main(args):
         if rtimes['locations'].values[c]>0:
             log.info('{:20s}: {:.2f} seconds ({:.2f}s / location)'.format(rtimes['city'].values[c],rtimes['runtime'].values[c],rtimes['time_per_loc'].values[c]))   
     if rtimes.shape[0]>0:
-        log.info('Average ML training time: {:.2f}s / location'.format(dttrain_total/rtimes.shape[0]))
+        log.info('Average ML training time: {:.2f}s / location'.format(dttrain_total/rtimes['locations'].sum()))
     return
 
 
