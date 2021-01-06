@@ -58,17 +58,21 @@ def main(args):
     # For every city, train bias-corrector for each available observation site and calculate bias-corrected model
     # predictions (to be compared against actual observations)
     runtimes = []
+    dttrain_total = 0.0
     for c in args.cities:
         t1 = time.perf_counter()
-        nlocations = _train_and_predict(args,allobs,allmod,c)
+        nlocations, dttrain = _train_and_predict(args,allobs,allmod,c)
         runtimes.append(pd.DataFrame({'city':[c],'locations':[nlocations],'runtime':[time.perf_counter()-t1]}))
+        dttrain_total += dttrain
     # show runtimes
     rtimes = pd.concat(runtimes)
     rtimes['time_per_loc'] = rtimes['runtime']/rtimes['locations']
     log.info('Run times:')
     for c in range(rtimes.shape[0]):
         if rtimes['locations'].values[c]>0:
-            log.info('{:20s}: {:.2f} seconds ({:.2f}s / location)'.format(rtimes['city'].values[c],rtimes['runtime'].values[c],rtimes['time_per_loc'].values[c]))
+            log.info('{:20s}: {:.2f} seconds ({:.2f}s / location)'.format(rtimes['city'].values[c],rtimes['runtime'].values[c],rtimes['time_per_loc'].values[c]))   
+    if rtimes.shape[0]>0:
+        log.info('Average ML training time: {:.2f}s / location'.format(dttrain_total/rtimes.shape[0]))
     return
 
 
@@ -91,7 +95,8 @@ def _train_and_predict(args,allobs,allmod,cityname):
 #---Compute NO2 anomalies for each location
     shap_list = []
     anomalies = []
-    nlocations = 0 
+    nlocations = 0
+    train_time = 0.0
     for l in locations:
         log.info('Building model for location {}'.format(l))
         # subset observation data
@@ -121,7 +126,8 @@ def _train_and_predict(args,allobs,allmod,cityname):
             Xtrain = pd.concat(Xsplit)
             Ytrain = np.concatenate(Ysplit)
             # Train model
-            bst = _train(args,Xtrain,Ytrain) 
+            bst, itrain_time = _train(args,Xtrain,Ytrain)
+            train_time += itrain_time
             # Validate 
             if args.validate==1:
                 _valid(args,l,bst,Xvalid,Yvalid,n) 
@@ -139,7 +145,7 @@ def _train_and_predict(args,allobs,allmod,cityname):
 #---Plot shap values
     if args.shap==1:
         _plot_shap_values(args,shap_list,title=longname) 
-    return nlocations
+    return nlocations, train_time
 
 
 def _read_obs(args):
@@ -246,8 +252,9 @@ def _train(args,Xtrain,Ytrain):
     train = xgb.DMatrix(Xt,np.array(Ytrain))
     params = {'booster':'gbtree'}
     #log.info('Training XGBoost model...')
+    t0 = time.perf_counter()
     bst = xgb.train(params,train)
-    return bst
+    return bst, time.perf_counter()-t0
 
 
 def _apply_bias(args,bst,obs,model):
