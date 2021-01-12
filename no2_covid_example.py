@@ -160,7 +160,7 @@ def _read_obs(args):
 def _read_model(args):
     '''read model output from file'''
     log = logging.getLogger(__name__)
-    SKIPVARS = ['ISO8601','location','lat','lon','CLDTT','Q10M','T10M','TS','U10M','V10M','ZPBL','year','month','day','hour']
+    SKIPVARS = ['ISO8601','weekday','trendday','location','lat','lon','CLDTT','Q10M','T10M','TS','U10M','V10M','ZPBL','year','month','day','hour']
     log.info('Reading model: {}'.format(args.modfile))
     model = pd.read_csv(args.modfile,parse_dates=['ISO8601'],date_parser=lambda x: dt.datetime.strptime(x, '%Y-%m-%dT%H:%M:%SZ'))
     # scale concentrations to ppbv (from mol/mol) and emissions to mg/m2/h (from kg/m2/s)
@@ -193,10 +193,11 @@ def _prepare_data(args,obs,model,mindate=None,maxdate=dt.datetime(2020,1,1),tren
         Xall = Xall.loc[Xall['ISO8601']>mindate]
     if maxdate is not None:
         Xall = Xall.loc[Xall['ISO8601']<maxdate]
-    # add calendar information: day of week and days since a given start day ('trendday')
-    Xall['weekday'] = [i.weekday() for i in Xall['ISO8601']]
-    if trendday is not None:
-        Xall['trendday'] = [(i-trendday).days for i in Xall['ISO8601']]
+    ## add calendar information: day of week and days since a given start day ('trendday')
+    # the calendar information is now already in the preprocessed data
+    #Xall['weekday'] = [i.weekday() for i in Xall['ISO8601']]
+    #if trendday is not None:
+    #    Xall['trendday'] = [(i-trendday).days for i in Xall['ISO8601']]
     # ML target is observation - model difference
     Yall = Xall['value'] - Xall['NO2']
     # drop values not needed
