@@ -21,7 +21,7 @@ import matplotlib.ticker as mtick
 import matplotlib.dates as mdates
 import time
 import cudf
-import cupy
+import cupy as cp
 
 from pandas.plotting import register_matplotlib_converters
 register_matplotlib_converters()
@@ -52,10 +52,12 @@ def main(args):
     handler = logging.StreamHandler(sys.stdout)
     handler.setLevel(logging.INFO)
     log.addHandler(handler)
+    ta = time.perf_counter()
     # Read NO2 observations from ascii file 
     allobs = _read_obs(args)
     # Read model output. This contains model-simulated NO2 plus a suite of other weather and chemistry parameter 
     allmod = _read_model(args)
+    tb = time.perf_counter()
     # For every city, train bias-corrector for each available observation site and calculate bias-corrected model
     # predictions (to be compared against actual observations)
     runtimes = []
@@ -70,9 +72,10 @@ def main(args):
     rtimes = pd.concat(runtimes)
     rtimes['time_per_loc'] = rtimes['runtime']/rtimes['locations']
     log.info('Run times:')
+    log.info('Loading data time: {:.2f}s'.format(tb-ta))
     for c in range(rtimes.shape[0]):
         if rtimes['locations'].values[c]>0:
-            log.info('{:20s}: {:.2f} seconds ({:.2f}s / location)'.format(rtimes['city'].values[c],rtimes['runtime'].values[c],rtimes['time_per_loc'].values[c]))
+            log.info('{:20s}: {:.2f} seconds ({:.2f}s / location)'.format(rtimes['city'].values[c],rtimes['runtime'].values[c],rtimes['time_per_loc'].values[c]))   
     if rtimes.shape[0]>0:
         log.info('Average ML training time: {:.2f}s / location'.format(dttrain_total/rtimes['locations'].sum()))
     return
@@ -87,18 +90,18 @@ def _train_and_predict(args,allobs,allmod,cityname):
     # sub-select observations that fall within specified lat/lon boundaries
     log.info('Working on city {}:'.format(cityname))
     subobs = allobs.loc[(allobs['CityKey']==cityname)]
-    locations = list(subobs['stationID'].unique())
+    locations = list(subobs['stationID'].to_pandas().unique())
+    log.info('Working on locations {}:'.format(locations))
     if len(locations)==0:
-        log.error('No observations found for city {}. Cities available in dataset: {}'.format(cityname,list(allobs['CityKey'].unique())))
+        log.error('No observations found for city {}. Cities available in dataset: {}'.format(cityname,list(allobs['CityKey'].to_pandas().unique())))
         return 0
     log.info('Will calculate bias-correction model for {} observation sites'.format(len(locations)))
     # longname is the name to be used for the figure title
-    #longname = cityname+', '+subobs['country'].values[0]
-    longname = cityname+', '+subobs['country'][0]
+    longname = cityname+', '+subobs['country'].iloc[0]
 #---Compute NO2 anomalies for each location
     shap_list = []
     anomalies = []
-    nlocations = 0 
+    nlocations = 0
     dttrain = 0.0
     for l in locations:
         log.info('Building model for location {}'.format(l))
@@ -113,29 +116,28 @@ def _train_and_predict(args,allobs,allmod,cityname):
             continue 
 #-------Train bias-correction model using XGBoost and apply bias correction to model output to obtain a business-as-usual estimate
 #       that can be compare against the actual observations
-        # Prepare features and target 
+        log.info('Prepare features and target')
         Xall, Yall, _ = _prepare_data(args,obs,model)
-        nrow = Xall.shape[0]
-        nrow_split = nrow // args.nsplit
         if Yall.shape[0]<args.minnobs:
             log.warning('Not enough observations found ({}<{}) - skip {}'.format(Yall.shape[0],args.minnobs,l))
             continue 
         for n in range(args.nsplit):
-            #log.info('Building model {} of {}'.format(n+1,args.nsplit))
+            log.info('Building model {} of {}'.format(n+1,args.nsplit))
             # Split into training and validation. To do so split full dataset into n segments, and set one aside for validation.
             # The remaining segments form the training data. 
-            i0 = n*nrow_split
-            i1 = i0+nrow_split
-            Xvalid = Xall[i0:i1]
-            Yvalid = Yall[i0:i1]
-            Xtrain = Xall[i1:]
-            Ytrain = Yall[i1:]
-            if i0>0:
-                Xtrain = cudf.concat([Xall[0:i0],Xtrain])
-                Ytrain = cudf.concat([Yall[0:i0],Ytrain])
-            # Train model
+            Xsplit = np.array_split(Xall.to_pandas(),args.nsplit)
+            Ysplit = np.array_split(Yall.to_pandas(),args.nsplit)
+            Xvalid = Xsplit.pop(n)
+            Yvalid = Ysplit.pop(n)
+            Xtrain = pd.concat(Xsplit)
+            Ytrain = np.concatenate(Ysplit)
+
+            Xvalid = cudf.from_pandas(Xvalid)
+            Yvalid = cudf.from_pandas(Yvalid)
+            Xtrain = cudf.from_pandas(Xtrain)
+            Ytrain = cp.asarray(Ytrain)
             bst, idttrain = _train(args,Xtrain,Ytrain)
-            dttrain += idttrain 
+            dttrain += idttrain
             # Validate 
             if args.validate==1:
                 _valid(args,l,bst,Xvalid,Yvalid,n) 
@@ -148,7 +150,7 @@ def _train_and_predict(args,allobs,allmod,cityname):
         # increase location counter
         nlocations += 1
 #---Plot results agreggated over all sites
-    no2diff = cudf.concat(anomalies)
+    no2diff = cudf.concat(anomalies).to_pandas()
     _make_timeseries(args,no2diff,title=longname)
 #---Plot shap values
     if args.shap==1:
@@ -161,15 +163,15 @@ def _read_obs(args):
     log = logging.getLogger(__name__)
     log.info('Reading observations: {}'.format(args.obsfile))
     obsdat = cudf.read_csv(args.obsfile,parse_dates=['ISO8601'],date_parser=lambda x: dt.datetime.strptime(x, '%Y-%m-%dT%H:%M:%SZ'))
-    #allobs = obsdat.loc[(obsdat['obstype']=='no2')&(~np.isnan(obsdat['value']))]
+#     allobs = obsdat.loc[(obsdat['obstype']=='no2')&(~np.isnan(obsdat['value']))]
     allobs = obsdat.loc[(obsdat['obstype']=='no2')]
     return allobs
 
 
-def _read_model(args,trendday=dt.datetime(2018,1,1)):
+def _read_model(args):
     '''read model output from file'''
     log = logging.getLogger(__name__)
-    SKIPVARS = ['ISO8601','trendday','weekday','location','lat','lon','CLDTT','Q10M','T10M','TS','U10M','V10M','ZPBL','year','month','day','hour']
+    SKIPVARS = ['ISO8601','weekday','trendday','location','lat','lon','CLDTT','Q10M','T10M','TS','U10M','V10M','ZPBL','year','month','day','hour']
     log.info('Reading model: {}'.format(args.modfile))
     model = cudf.read_csv(args.modfile,parse_dates=['ISO8601'],date_parser=lambda x: dt.datetime.strptime(x, '%Y-%m-%dT%H:%M:%SZ'))
     # scale concentrations to ppbv (from mol/mol) and emissions to mg/m2/h (from kg/m2/s)
@@ -184,10 +186,8 @@ def _read_model(args,trendday=dt.datetime(2018,1,1)):
             scal = EMISSCAL 
         else:
             scal = CONCSCAL
-        model[v] = model[v] * scal 
-    #model['weekday'] = [dt.datetime(i,j,k).weekday() for i,j,k in zip(model['year'],model['month'],model['day'])]
-    #if trendday is not None:
-    #    model['trendday'] = [(dt.datetime(i,j,k)-trendday).days for i,j,k in zip(model['year'],model['month'],model['day'])]
+        model = model.fillna(0.0)
+        model[v] = model[v].values * scal
     return model 
 
 
@@ -206,11 +206,9 @@ def _prepare_data(args,obs,model,mindate=None,maxdate=dt.datetime(2020,1,1),tren
     if maxdate is not None:
         Xall = Xall.loc[Xall['ISO8601']<maxdate]
     # add calendar information: day of week and days since a given start day ('trendday')
-    ##Xall['weekday'] = [i.weekday() for i in Xall['ISO8601']]
-    #Xall['weekday'] = [dt.datetime(i,j,k).weekday() for i,j,k in zip(Xall['year'],Xall['month'],Xall['day'])]
+    #Xall['weekday'] = [i.weekday() for i in Xall['ISO8601']]
     #if trendday is not None:
         #Xall['trendday'] = [(i-trendday).days for i in Xall['ISO8601']]
-        #Xall['trendday'] = [(dt.datetime(i,j,k)-trendday).days for i,j,k in zip(Xall['year'],Xall['month'],Xall['day'])]
     # ML target is observation - model difference
     Yall = Xall['value'] - Xall['NO2']
     # drop values not needed
@@ -222,7 +220,11 @@ def _prepare_data(args,obs,model,mindate=None,maxdate=dt.datetime(2020,1,1),tren
 def _valid(args,location,bst,Xvalid,Yvalid,instance):
     '''make prediction using XGboost model'''
     log = logging.getLogger(__name__)
-    bias,conc,dates = _predict(args,bst,Xvalid)
+    bias,conc,dates,shap = _predict(args,bst,Xvalid)
+    bias = bias.get()
+    conc = conc.get()
+    Xvalid = Xvalid.to_pandas()
+    Yvalid = Yvalid.to_pandas()
     fig, axs = plt.subplots(1,3,figsize=(15,5))
     axs[0] = _plot_scatter(axs[0],bias,Yvalid,-60.,60.,'Predicted bias [ppbv]','True bias [ppbv]','Bias')
     axs[1] = _plot_scatter(axs[1],Xvalid['NO2'],Xvalid['NO2'].values+Yvalid,0.,60.,'Model concentration [ppbv]','Observed concentration [ppbv]','Original')
@@ -239,12 +241,11 @@ def _valid(args,location,bst,Xvalid,Yvalid,instance):
 def _predict(args,bst,Xpredict):
     '''make prediction using XGBoost model and return predicted bias and bias-corrected concentration'''
     log = logging.getLogger(__name__)
-    Xp = Xpredict.copy()
-    dates = Xp.pop('ISO8601')
-    predict = xgb.DMatrix(Xp)
-    predicted_bias = bst.predict(predict)
+    dates = Xpredict.pop('ISO8601')
+    predict = xgb.DMatrix(Xpredict)
+    predicted_bias = cp.asarray(bst.predict(predict))
     predicted_conc = Xpredict['NO2'].values + predicted_bias    
-    shap_values = _get_shap_values(args,bst,Xp) if args.shap==1 else None
+    shap_values = _get_shap_values(args,bst,Xpredict) if args.shap==1 else None
     return predicted_bias, predicted_conc, dates, shap_values
 
 
@@ -261,15 +262,13 @@ def _get_shap_values(args,bst,X):
 def _train(args,Xtrain,Ytrain):
     '''train XGBoost model'''
     log = logging.getLogger(__name__)
-    Xt = Xtrain.copy()
-    Xt.pop('ISO8601')
-    train = xgb.DMatrix(Xt,Ytrain)
-    params = {'booster':'gbtree'}
+    Xtrain.pop('ISO8601')
+    train = xgb.DMatrix(data=Xtrain,label=Ytrain)
+    params = {'booster':'gbtree','tree_method':'gpu_hist'}
     #log.info('Training XGBoost model...')
     t0 = time.perf_counter()
     bst = xgb.train(params,train)
-    t1 = time.perf_counter()
-    return bst, t1-t0
+    return bst, time.perf_counter()-t0
 
 
 def _apply_bias(args,bst,obs,model):
@@ -277,7 +276,7 @@ def _apply_bias(args,bst,obs,model):
     log = logging.getLogger(__name__)
     Xall, Yall, conc_obs = _prepare_data(args,obs,model,mindate=dt.datetime(2018,1,1),maxdate=None)
     bias_pred, conc_pred, dates, shap_values = _predict(args,bst,Xall)
-    anomaly = conc_obs - conc_pred
+    anomaly = conc_obs - cudf.Series(conc_pred)
     return cudf.DataFrame({'ISO8601':dates,'predicted':conc_pred,'observed':conc_obs,'anomaly':anomaly}), shap_values
 
 
@@ -381,8 +380,9 @@ def _plot_scatter(ax,x,y,minval,maxval,xlab,ylab,title):
 def parse_args():
     p = argparse.ArgumentParser(description='Undef certain variables')
     p.add_argument('-o','--obsfile',type=str,help='observation file',default='https://gmao.gsfc.nasa.gov/gmaoftp/geoscf/COVID_NO2/examples/obs.csv')
-    #p.add_argument('-m','--modfile',type=str,help='model file',default='https://gmao.gsfc.nasa.gov/gmaoftp/geoscf/COVID_NO2/examples/model.csv')
-    p.add_argument('-m','--modfile',type=str,help='model file',default='model.csv')
+#     p.add_argument('-o','--obsfile',type=str,help='observation file',default='obs.csv')
+    p.add_argument('-m','--modfile',type=str,help='model file',default='https://gmao.gsfc.nasa.gov/gmaoftp/geoscf/COVID_NO2/examples/model.csv')
+#     p.add_argument('-m','--modfile',type=str,help='model file',default='model.csv')
     p.add_argument('-c','--cities',type=str,nargs="+",help='city names',default='NewYork')
     p.add_argument('-n','--nsplit',type=int,help='number of cross-fold validations',default=8)
     p.add_argument('-v','--validate',type=int,help='make validation figures (1=yes; 0=no)?',default=0)
