@@ -20,6 +20,8 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
 import matplotlib.dates as mdates
 import time
+import cudf
+import cupy as cp
 
 from pandas.plotting import register_matplotlib_converters
 register_matplotlib_converters()
@@ -70,11 +72,12 @@ def main(args):
     # show runtimes
     rtimes = pd.concat(runtimes)
     rtimes['time_per_loc'] = rtimes['runtime']/rtimes['locations']
-    log.info('Run times:')
+    log.info('Run times ({}):'.format('GPU' if args.gpu==1 else 'CPU'))
     log.info('Loading data time: {:.2f}s'.format(tb-ta))
+    log.info('Run time per city (train, predict, plot):')
     for c in range(rtimes.shape[0]):
         if rtimes['locations'].values[c]>0:
-            log.info('{:20s}: {:.2f} seconds ({:.2f}s / location)'.format(rtimes['city'].values[c],rtimes['runtime'].values[c],rtimes['time_per_loc'].values[c]))   
+            log.info('- {:20s}: {:.2f} seconds ({:.2f}s / location)'.format(rtimes['city'].values[c],rtimes['runtime'].values[c],rtimes['time_per_loc'].values[c]))   
     if rtimes.shape[0]>0:
         log.info('Average ML training time: {:.2f}s / location'.format(dttrain_total/rtimes['locations'].sum()))
     return
@@ -89,10 +92,11 @@ def _train_and_predict(args,allobs,allmod,cityname):
     # sub-select observations that fall within specified lat/lon boundaries
     log.info('Working on city {}:'.format(cityname))
     subobs = allobs.loc[(allobs['CityKey']==cityname)]
-    locations = list(subobs['stationID'].unique())
+    locations = list(subobs['stationID'].to_pandas().unique()) if args.gpu==1 else list(subobs['stationID'].unique())
     log.info('Working on locations {}:'.format(locations))
     if len(locations)==0:
-        log.error('No observations found for city {}. Cities available in dataset: {}'.format(cityname,list(allobs['CityKey'].unique())))
+        cities = list(allobs['CityKey'].to_pandas().unique()) if args.gpu==1 else list(allobs['CityKey'].unique())
+        log.error('No observations found for city {}. Cities available in dataset: {}'.format(cityname,cities))
         return 0
     log.info('Will calculate bias-correction model for {} observation sites'.format(len(locations)))
     # longname is the name to be used for the figure title
@@ -124,12 +128,21 @@ def _train_and_predict(args,allobs,allmod,cityname):
             log.info('Building model {} of {}'.format(n+1,args.nsplit))
             # Split into training and validation. To do so split full dataset into n segments, and set one aside for validation.
             # The remaining segments form the training data. 
-            Xsplit = np.array_split(Xall,args.nsplit)
-            Ysplit = np.array_split(Yall,args.nsplit)
+            if args.gpu==1:
+                Xsplit = np.array_split(Xall.to_pandas(),args.nsplit)
+                Ysplit = np.array_split(Yall.to_pandas(),args.nsplit)
+            else:
+                Xsplit = np.array_split(Xall,args.nsplit)
+                Ysplit = np.array_split(Yall,args.nsplit)
             Xvalid = Xsplit.pop(n)
             Yvalid = Ysplit.pop(n)
             Xtrain = pd.concat(Xsplit)
             Ytrain = np.concatenate(Ysplit)
+            if args.gpu==1:
+                Xvalid = cudf.from_pandas(Xvalid)
+                Yvalid = cudf.from_pandas(Yvalid)
+                Xtrain = cudf.from_pandas(Xtrain)
+                Ytrain = cp.asarray(Ytrain)
             bst, idttrain = _train(args,Xtrain,Ytrain)
             dttrain += idttrain
             # Validate 
@@ -144,7 +157,7 @@ def _train_and_predict(args,allobs,allmod,cityname):
         # increase location counter
         nlocations += 1
 #---Plot results agreggated over all sites
-    no2diff = pd.concat(anomalies)
+    no2diff = cudf.concat(anomalies).to_pandas() if args.gpu==1 else pd.concat(anomalies)
     _make_timeseries(args,no2diff,title=longname)
 #---Plot shap values
     if args.shap==1:
@@ -156,8 +169,10 @@ def _read_obs(args):
     '''read observations from file'''
     log = logging.getLogger(__name__)
     log.info('Reading observations: {}'.format(args.obsfile))
-    obsdat = pd.read_csv(args.obsfile,parse_dates=['ISO8601'],date_parser=lambda x: dt.datetime.strptime(x, '%Y-%m-%dT%H:%M:%SZ'))
-#     allobs = obsdat.loc[(obsdat['obstype']=='no2')&(~np.isnan(obsdat['value']))]
+    if args.gpu==1:
+        obsdat = cudf.read_csv(args.obsfile,parse_dates=['ISO8601'],date_parser=lambda x: dt.datetime.strptime(x, '%Y-%m-%dT%H:%M:%SZ'))
+    else:
+        obsdat = pd.read_csv(args.obsfile,parse_dates=['ISO8601'],date_parser=lambda x: dt.datetime.strptime(x, '%Y-%m-%dT%H:%M:%SZ'))
     allobs = obsdat.loc[(obsdat['obstype']=='no2')]
     return allobs
 
@@ -167,7 +182,10 @@ def _read_model(args):
     log = logging.getLogger(__name__)
     SKIPVARS = ['ISO8601','weekday','trendday','location','lat','lon','CLDTT','Q10M','T10M','TS','U10M','V10M','ZPBL','year','month','day','hour']
     log.info('Reading model: {}'.format(args.modfile))
-    model = pd.read_csv(args.modfile,parse_dates=['ISO8601'],date_parser=lambda x: dt.datetime.strptime(x, '%Y-%m-%dT%H:%M:%SZ'))
+    if args.gpu==1:
+        model = cudf.read_csv(args.modfile,parse_dates=['ISO8601'],date_parser=lambda x: dt.datetime.strptime(x, '%Y-%m-%dT%H:%M:%SZ'))
+    else:
+        model = pd.read_csv(args.modfile,parse_dates=['ISO8601'],date_parser=lambda x: dt.datetime.strptime(x, '%Y-%m-%dT%H:%M:%SZ'))
     # scale concentrations to ppbv (from mol/mol) and emissions to mg/m2/h (from kg/m2/s)
     for v in model:
         if v in SKIPVARS:
@@ -180,7 +198,7 @@ def _read_model(args):
             scal = EMISSCAL 
         else:
             scal = CONCSCAL
-        model = model.fillna(0.0)
+        model[v] = model[v].fillna(0.0)
         model[v] = model[v].values * scal 
     return model 
 
@@ -215,6 +233,11 @@ def _valid(args,location,bst,Xvalid,Yvalid,instance):
     '''make prediction using XGboost model'''
     log = logging.getLogger(__name__)
     bias,conc,dates,shap = _predict(args,bst,Xvalid)
+    if args.gpu==1:
+        bias = bias.get()
+        conc = conc.get()
+        Xvalid = Xvalid.to_pandas()
+        Yvalid = Yvalid.to_pandas()
     fig, axs = plt.subplots(1,3,figsize=(15,5))
     axs[0] = _plot_scatter(axs[0],bias,Yvalid,-60.,60.,'Predicted bias [ppbv]','True bias [ppbv]','Bias')
     axs[1] = _plot_scatter(axs[1],Xvalid['NO2'],Xvalid['NO2'].values+Yvalid,0.,60.,'Model concentration [ppbv]','Observed concentration [ppbv]','Original')
@@ -234,18 +257,21 @@ def _predict(args,bst,Xpredict):
     dates = Xpredict.pop('ISO8601')
     predict = xgb.DMatrix(Xpredict)
     predicted_bias = bst.predict(predict)
+    if args.gpu==1:
+        predicted_bias = cp.asarray(predicted_bias)
     predicted_conc = Xpredict['NO2'].values + predicted_bias    
-    shap_values = _get_shap_values(args,bst,Xpredict) if args.shap==1 else None
+    shap_values = _get_shap_values(args,bst,predict) if args.shap==1 else None
     return predicted_bias, predicted_conc, dates, shap_values
 
 
 def _get_shap_values(args,bst,X):
     '''Get SHAP values for given xgboost object bst and set of input features X'''
-    import shap
     log = logging.getLogger(__name__)
-    explainer = shap.TreeExplainer(bst)
-    shap_array = np.abs(explainer.shap_values(X))
-    shap_values = pd.DataFrame(data = shap_array,columns=list(bst.feature_names))
+    predictor = "gpu_predictor" if args.gpu==1 else "cpu_predictor"
+    bst.set_param({"predictor": predictor}) 
+    shap_array = np.abs(bst.predict(X,pred_contribs=True))
+    # shap_array has n+1 values, last column is the bias
+    shap_values = pd.DataFrame(data=shap_array[:,:-1],columns=list(bst.feature_names))
     return shap_values 
 
 
@@ -254,7 +280,8 @@ def _train(args,Xtrain,Ytrain):
     log = logging.getLogger(__name__)
     Xtrain.pop('ISO8601')
     train = xgb.DMatrix(data=Xtrain,label=Ytrain)
-    params = {'booster':'gbtree','tree_method':'hist'}
+    tree_method = 'gpu_hist' if args.gpu==1 else 'hist'
+    params = {'booster':'gbtree','tree_method':tree_method}
     #log.info('Training XGBoost model...')
     t0 = time.perf_counter()
     bst = xgb.train(params,train)
@@ -266,8 +293,13 @@ def _apply_bias(args,bst,obs,model):
     log = logging.getLogger(__name__)
     Xall, Yall, conc_obs = _prepare_data(args,obs,model,mindate=dt.datetime(2018,1,1),maxdate=None)
     bias_pred, conc_pred, dates, shap_values = _predict(args,bst,Xall)
-    anomaly = conc_obs - conc_pred
-    return pd.DataFrame({'ISO8601':dates,'predicted':conc_pred,'observed':conc_obs,'anomaly':anomaly}), shap_values
+    if args.gpu==1:
+        anomaly = conc_obs - cudf.Series(conc_pred)
+        odat = cudf.DataFrame({'ISO8601':dates,'predicted':conc_pred,'observed':conc_obs,'anomaly':anomaly}), shap_values
+    else:
+        anomaly = conc_obs - conc_pred
+        odat = pd.DataFrame({'ISO8601':dates,'predicted':conc_pred,'observed':conc_obs,'anomaly':anomaly}), shap_values
+    return odat 
 
 
 def _make_timeseries(args,anomalies,rolling=21,mindate=dt.datetime(2019,1,1),title='unknown'):
@@ -313,25 +345,23 @@ def _make_timeseries(args,anomalies,rolling=21,mindate=dt.datetime(2019,1,1),tit
 
 def _plot_shap_values(args,shap_list,title):
     '''Make boxplot of SHAP values for the given location'''
-    import seaborn as sns
     log = logging.getLogger(__name__)
     NFEATURES = 20 # number of features to plot
-    # get dataframe with all shap values and melt into 2-column array (one column for feature name, the other for the SHAP value)
+    # get dataframe with all shap values, reduce data to first NFEATURES number of features, and sort by median
     shaps = pd.concat(shap_list)
-    df = shaps.melt(var_name='Feature',value_name='Shap')
-    # median value for each feature, used to rank the SHAP values in the boxplot
-    medians = df.groupby('Feature').median().sort_values(by='Shap',ascending=False).reset_index()
-    # reduce data to first NFEATURES number of features
-    features = list(medians['Feature'].values[:NFEATURES])
-    medians = medians.loc[medians['Feature'].isin(features)]
-    df = df.loc[df['Feature'].isin(features)]
-    # make plot
+    medians = shaps.median()
+    medians = pd.DataFrame(medians).sort_values(by=0,ascending=False)
+    features = list(medians.index[:NFEATURES])
+    shaps = shaps[list(medians.index[:NFEATURES])[::-1]]
+    # make boxplot
     fig = plt.figure(figsize=(6,4))
-    ax = fig.add_subplot(1,1,1)
-    ax = sns.boxplot(y="Feature", x="Shap", data=df, showfliers=False, order=features, ax=ax )
-    ax.set_xlabel('absolute SHAP value')
-    ax.set_xscale("log")
-    ax.set_title(title)
+    box = plt.boxplot(shaps,patch_artist=True,showfliers=False,vert=False,labels=shaps.columns)
+    colors = list(plt.cm.jet(1.*np.arange(NFEATURES)/float(NFEATURES))) 
+    for patch, color in zip(box['boxes'], colors):
+        patch.set_facecolor(color)
+    plt.xlabel('absolute SHAP value')
+    plt.xscale("log")
+    plt.title(title)
     plt.tight_layout()
     ofile = 'shap_values_'+title.replace(' ','').replace(',','')+'.png'
     plt.savefig(ofile)
@@ -369,14 +399,13 @@ def _plot_scatter(ax,x,y,minval,maxval,xlab,ylab,title):
 
 def parse_args():
     p = argparse.ArgumentParser(description='Undef certain variables')
-#     p.add_argument('-o','--obsfile',type=str,help='observation file',default='obs.csv')
     p.add_argument('-o','--obsfile',type=str,help='observation file',default='https://gmao.gsfc.nasa.gov/gmaoftp/geoscf/COVID_NO2/examples/obs.csv')
-#     p.add_argument('-m','--modfile',type=str,help='model file',default='model.csv')
     p.add_argument('-m','--modfile',type=str,help='model file',default='https://gmao.gsfc.nasa.gov/gmaoftp/geoscf/COVID_NO2/examples/model.csv')
     p.add_argument('-c','--cities',type=str,nargs="+",help='city names',default='NewYork')
     p.add_argument('-n','--nsplit',type=int,help='number of cross-fold validations',default=8)
     p.add_argument('-v','--validate',type=int,help='make validation figures (1=yes; 0=no)?',default=0)
     p.add_argument('-s','--shap',type=int,help='plot shap values for each city (1=yes; 0=no)?',default=0)
+    p.add_argument('-g','--gpu',type=int,help='run on gpu?',default=0)
     p.add_argument('-mn','--minnobs',type=int,help='minimum number of required observations (for training)',default=8760)
     return p.parse_args()
 
