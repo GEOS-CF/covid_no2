@@ -217,10 +217,6 @@ def _prepare_data(args,obs,model,mindate=None,maxdate=dt.datetime(2020,1,1),tren
         Xall = Xall.loc[Xall['ISO8601']>mindate]
     if maxdate is not None:
         Xall = Xall.loc[Xall['ISO8601']<maxdate]
-    # add calendar information: day of week and days since a given start day ('trendday')
-    #Xall['weekday'] = [i.weekday() for i in Xall['ISO8601']]
-    #if trendday is not None:
-        #Xall['trendday'] = [(i-trendday).days for i in Xall['ISO8601']]
     # ML target is observation - model difference
     Yall = Xall['value'] - Xall['NO2']
     # drop values not needed
